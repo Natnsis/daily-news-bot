@@ -230,6 +230,75 @@ bot.action("setup_new", async (ctx) => {
   );
 });
 
+// Test command to send news instantly
+bot.command("test", async (ctx) => {
+  const userId = ctx.from.id;
+  const configs = await prisma.channelConfig.findMany({
+    where: { ownerId: BigInt(userId) },
+  });
+
+  if (configs.length === 0) {
+    return ctx.reply("No channels configured. Use /setup first.");
+  }
+
+  if (configs.length === 1) {
+    const config = configs[0];
+    await ctx.reply(`🚀 Sending an instant news post to **${config.name}**...`, {
+      parse_mode: "Markdown",
+    });
+    return triggerNewsPost(ctx, config.id);
+  }
+
+  const buttons = configs.map((c) => [
+    Markup.button.callback(`📢 Test ${c.name || c.id}`, `trigger_post_${c.id}`),
+  ]);
+
+  ctx.reply(
+    "🧪 **Instant Test Post**\nSelect a channel to send sample news now:",
+    {
+      parse_mode: "Markdown",
+      ...Markup.inlineKeyboard(buttons),
+    },
+  );
+});
+
+async function triggerNewsPost(ctx: Context, channelId: string) {
+  const config = await prisma.channelConfig.findUnique({
+    where: { id: channelId },
+  });
+  if (!config) return ctx.reply("❌ Configuration not found.");
+
+  const category =
+    config.categories[Math.floor(Math.random() * config.categories.length)] ||
+    "general";
+  const articles = await fetchTopHeadlines(category);
+  const message = formatNewsMessage(articles, category);
+
+  try {
+    await ctx.telegram.sendMessage(channelId, message, {
+      parse_mode: "Markdown",
+      link_preview_options: { is_disabled: false },
+    });
+    if (ctx.callbackQuery) {
+      await ctx.answerCbQuery("News posted!");
+    }
+    await ctx.reply(`✅ News successfully posted to **${config.name}**!`, {
+      parse_mode: "Markdown",
+    });
+  } catch (err: any) {
+    const errorMsg = `❌ Failed to post news: ${err.message}`;
+    if (ctx.callbackQuery) {
+      await ctx.answerCbQuery(errorMsg);
+    }
+    await ctx.reply(errorMsg);
+  }
+}
+
+bot.action(/trigger_post_(.+)/, async (ctx) => {
+  const channelId = (ctx.match as any)[1];
+  await triggerNewsPost(ctx, channelId);
+});
+
 // Handle text and forwarded messages for channel identification
 bot.on(["text", "forward_date"], async (ctx) => {
   const userId = ctx.from?.id;
@@ -483,72 +552,6 @@ async function saveConfiguration(
   }
 }
 
-// Test command to send news instantly
-bot.command("test", async (ctx) => {
-  const userId = ctx.from.id;
-  const configs = await prisma.channelConfig.findMany({
-    where: { ownerId: BigInt(userId) },
-  });
-
-  if (configs.length === 0) {
-    return ctx.reply("No channels configured. Use /setup first.");
-  }
-
-  if (configs.length === 1) {
-    const config = configs[0];
-    await ctx.reply(`🚀 Sending an instant news post to **${config.name}**...`, { parse_mode: 'Markdown' });
-    return triggerNewsPost(ctx, config.id);
-  }
-
-  const buttons = configs.map((c) => [
-    Markup.button.callback(`📢 Test ${c.name || c.id}`, `trigger_post_${c.id}`),
-  ]);
-
-  ctx.reply(
-    "🧪 **Instant Test Post**\nSelect a channel to send sample news now:",
-    {
-      parse_mode: "Markdown",
-      ...Markup.inlineKeyboard(buttons),
-    },
-  );
-});
-
-async function triggerNewsPost(ctx: Context, channelId: string) {
-  const config = await prisma.channelConfig.findUnique({
-    where: { id: channelId },
-  });
-  if (!config) return ctx.reply("❌ Configuration not found.");
-
-  const category =
-    config.categories[Math.floor(Math.random() * config.categories.length)] ||
-    "general";
-  const articles = await fetchTopHeadlines(category);
-  const message = formatNewsMessage(articles, category);
-
-  try {
-    await ctx.telegram.sendMessage(channelId, message, {
-      parse_mode: "Markdown",
-      link_preview_options: { is_disabled: false },
-    });
-    if (ctx.callbackQuery) {
-      await ctx.answerCbQuery("News posted!");
-    }
-    await ctx.reply(`✅ News successfully posted to **${config.name}**!`, {
-      parse_mode: "Markdown",
-    });
-  } catch (err: any) {
-    const errorMsg = `❌ Failed to post news: ${err.message}`;
-    if (ctx.callbackQuery) {
-      await ctx.answerCbQuery(errorMsg);
-    }
-    await ctx.reply(errorMsg);
-  }
-}
-
-bot.action(/trigger_post_(.+)/, async (ctx) => {
-  const channelId = (ctx.match as any)[1];
-  await triggerNewsPost(ctx, channelId);
-});
 
 export function launchBot() {
   console.log("Attempting to launch Telegram bot...");
