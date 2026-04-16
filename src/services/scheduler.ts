@@ -1,8 +1,27 @@
 import cron from 'node-cron';
-import { fetchTopHeadlines, formatNewsMessage } from './newsService.js';
+import {
+  findArticlesToPost,
+  formatNewsMessage,
+  formatNoNewsMessage,
+  normalizeSource,
+} from './newsService.js';
 import { DateTime } from 'luxon';
 import { Telegraf } from 'telegraf';
 import { prisma } from '../lib/prisma.js';
+
+interface StoredChannelConfig {
+  id: string;
+  name: string | null;
+  ownerId: bigint;
+  source?: string | null;
+  categories: string[];
+  sentArticleUrls?: string[];
+  scheduledTimes: string[];
+  postsPerDay: number;
+  isRandom: boolean;
+  timezone: string;
+  lastPostedAt: Date | null;
+}
 
 export function startScheduler(bot: Telegraf<any>) {
   // Run every minute
@@ -10,14 +29,24 @@ export function startScheduler(bot: Telegraf<any>) {
     const now = DateTime.now();
     
     // Get all active channels
-    const channels = await prisma.channelConfig.findMany({
+    const channels = (await prisma.channelConfig.findMany({
       where: { isActive: true }
-    });
+    })) as StoredChannelConfig[];
 
     for (const channel of channels) {
-      const { id, scheduledTimes, isRandom, postsPerDay, timezone, categories, lastPostedAt } = channel;
+      const {
+        id,
+        scheduledTimes,
+        isRandom,
+        postsPerDay,
+        timezone,
+        categories,
+        lastPostedAt,
+        sentArticleUrls,
+      } = channel;
       const localNow = now.setZone(timezone || 'UTC');
       const timeStr = localNow.toFormat('HH:mm');
+      const source = normalizeSource(channel.source);
       
       // 1. Daily Random Time Generation
       // If random is enabled and we haven't generated times yet today (or they are empty)
@@ -47,20 +76,43 @@ export function startScheduler(bot: Telegraf<any>) {
 
         console.log(`Posting news to channel ${id} at ${timeStr}`);
         
-        const category = categories[Math.floor(Math.random() * categories.length)] || 'general';
+        const availableCategories =
+          source === 'devto' ? ['technology'] : categories.length > 0 ? categories : ['general'];
+        const category =
+          availableCategories[Math.floor(Math.random() * availableCategories.length)] ||
+          'general';
         
         try {
-          const articles = await fetchTopHeadlines(category);
-          const message = formatNewsMessage(articles, category);
+          const articles = await findArticlesToPost(
+            source,
+            category,
+            sentArticleUrls ?? [],
+          );
+
+          if (articles.length === 0) {
+            await bot.telegram.sendMessage(
+              channel.ownerId.toString(),
+              formatNoNewsMessage(source, category, channel.name ?? channel.id),
+            ).catch((dmError: any) => {
+              console.error(`Failed to send no-news DM to owner ${channel.ownerId}:`, dmError.message);
+            });
+            continue;
+          }
+
+          const message = formatNewsMessage(articles, category, source);
           
           await bot.telegram.sendMessage(id, message, { 
-            parse_mode: 'Markdown',
-            link_preview_options: { is_disabled: false }
+            link_preview_options: { is_disabled: true }
           });
           
-          await prisma.channelConfig.update({
+          await (prisma.channelConfig as any).update({
             where: { id },
-            data: { lastPostedAt: new Date() }
+            data: {
+              lastPostedAt: new Date(),
+              sentArticleUrls: [
+                ...new Set([...(sentArticleUrls ?? []), ...articles.map((article) => article.url)]),
+              ].slice(-200),
+            }
           });
         } catch (err: any) {
           console.error(`Failed to post to channel ${id}:`, err.message);

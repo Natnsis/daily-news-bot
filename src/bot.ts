@@ -3,41 +3,115 @@ import dotenv from "dotenv";
 import { prisma } from "./lib/prisma.js";
 import { startScheduler } from "./services/scheduler.js";
 import {
-  fetchTopHeadlines,
+  findArticlesToPost,
   formatNewsMessage,
+  formatNoNewsMessage,
+  getAvailableCategories,
+  normalizeSource,
+  type NewsSource,
 } from "./services/newsService.js";
 
 dotenv.config();
 
 const bot = new Telegraf<Context>(process.env.TELEGRAM_BOT_TOKEN!);
 
-const NEWS_CATEGORIES = [
-  "business",
-  "entertainment",
-  "general",
-  "health",
-  "science",
-  "sports",
-  "technology",
-];
-
 // State management for setup wizard
 interface SetupState {
   step:
     | "AWAITING_CHANNEL"
+    | "AWAITING_SOURCE"
     | "AWAITING_CATEGORIES"
     | "AWAITING_TIMING_TYPE"
     | "AWAITING_SPECIFIC_TIMES"
     | "AWAITING_FREQUENCY";
   channelId?: string;
   channelName?: string;
+  source?: NewsSource;
   categories: string[];
   isRandom?: boolean;
   scheduledTimes: string[];
   postsPerDay: number;
 }
 
+interface StoredChannelConfig {
+  id: string;
+  name: string | null;
+  ownerId: bigint;
+  source?: string | null;
+  categories: string[];
+  sentArticleUrls?: string[];
+  scheduledTimes: string[];
+  postsPerDay: number;
+  isRandom: boolean;
+  timezone: string;
+  lastPostedAt: Date | null;
+  nextRunAt: Date | null;
+  isActive: boolean;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
 const userStates = new Map<number, SetupState>();
+
+function getSourceLabel(source: NewsSource): string {
+  return source === "devto" ? "DEV Community" : "NewsAPI";
+}
+
+function getConfiguredCategories(source: NewsSource, categories: string[]): string[] {
+  if (source === "devto") {
+    return ["technology"];
+  }
+
+  const allowed = new Set(getAvailableCategories(source));
+  const filtered = categories.filter((category) => allowed.has(category));
+  return filtered.length > 0 ? filtered : ["general"];
+}
+
+function selectCategory(source: NewsSource, categories: string[]): string {
+  const configuredCategories = getConfiguredCategories(source, categories);
+  return (
+    configuredCategories[
+      Math.floor(Math.random() * configuredCategories.length)
+    ] ?? "general"
+  );
+}
+
+function buildSourceKeyboard(selectedSource?: NewsSource) {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback(
+        `${selectedSource === "newsapi" ? "✅ " : ""}NewsAPI`,
+        "setup_source_newsapi",
+      ),
+    ],
+    [
+      Markup.button.callback(
+        `${selectedSource === "devto" ? "✅ " : ""}DEV Community`,
+        "setup_source_devto",
+      ),
+    ],
+  ]);
+}
+
+function buildCategoryKeyboard(source: NewsSource, selectedCategories: string[]) {
+  const buttons = getAvailableCategories(source).map((category) => {
+    const isSelected = selectedCategories.includes(category);
+    return Markup.button.callback(
+      `${isSelected ? "✅ " : ""}${category}`,
+      `setup_toggle_${category}`,
+    );
+  });
+
+  const rows = [];
+  for (let i = 0; i < buttons.length; i += 2) {
+    rows.push(buttons.slice(i, i + 2));
+  }
+  rows.push([
+    Markup.button.callback("✅ Done Selecting", "setup_categories_done"),
+  ]);
+
+  return Markup.inlineKeyboard(rows);
+}
 
 // Welcome message
 bot.start((ctx) => {
@@ -83,15 +157,16 @@ bot.command("config", async (ctx) => {
 
 bot.action(/manage_(.+)/, async (ctx) => {
   const channelId = (ctx.match as any)[1];
-  const config = await prisma.channelConfig.findUnique({
+  const config = (await prisma.channelConfig.findUnique({
     where: { id: channelId },
-  });
+  })) as StoredChannelConfig | null;
   if (!config) {
     return ctx.answerCbQuery("Config not found.");
   }
 
   const message =
     `⚙️ **Managing: ${config.name ?? config.id}**\n\n` +
+    `Source: ${getSourceLabel(normalizeSource(config.source))}\n` +
     `Categories: ${config.categories.join(", ")}\n` +
     `Timing: ${config.isRandom ? "🎲 Random" : "🕒 " + config.scheduledTimes.join(", ")}\n` +
     `Frequency: ${config.postsPerDay} per day\n` +
@@ -100,6 +175,7 @@ bot.action(/manage_(.+)/, async (ctx) => {
   ctx.editMessageText(message, {
     parse_mode: "Markdown",
     ...Markup.inlineKeyboard([
+      [Markup.button.callback("📰 Change Source", `edit_source_${channelId}`)],
       [Markup.button.callback("📂 Change Categories", `edit_cat_${channelId}`)],
       [Markup.button.callback("⏰ Change Timing", `edit_time_${channelId}`)],
       [
@@ -133,58 +209,80 @@ bot.action(/delete_final_(.+)/, async (ctx) => {
 
 bot.action(/edit_cat_(.+)/, async (ctx) => {
   const channelId = (ctx.match as any)[1];
-  const config = await prisma.channelConfig.findUnique({
+  const config = (await prisma.channelConfig.findUnique({
     where: { id: channelId },
-  });
+  })) as StoredChannelConfig | null;
   if (!config) return;
+
+  const source = normalizeSource(config.source);
+  if (source === "devto") {
+    await ctx.answerCbQuery(
+      "DEV Community posts are technology-only. Change source to unlock other categories.",
+    );
+    return;
+  }
 
   const userId = ctx.from!.id;
   userStates.set(userId, {
     step: "AWAITING_CATEGORIES",
     channelId: config.id,
     channelName: config.name ?? config.id,
-    categories: config.categories,
+    source,
+    categories: getConfiguredCategories(source, config.categories),
     scheduledTimes: config.scheduledTimes,
     postsPerDay: config.postsPerDay,
     isRandom: config.isRandom,
   });
 
-  const buttons = NEWS_CATEGORIES.map((cat) => {
-    const isSelected = config.categories.includes(cat);
-    return Markup.button.callback(
-      `${isSelected ? "✅ " : ""}${cat}`,
-      `setup_toggle_${cat}`,
-    );
-  });
-
-  const rows = [];
-  for (let i = 0; i < buttons.length; i += 2)
-    rows.push(buttons.slice(i, i + 2));
-  rows.push([
-    Markup.button.callback("✅ Done Selecting", "setup_categories_done"),
-  ]);
-
   await ctx.editMessageText(
     "Select news categories:",
-    Markup.inlineKeyboard(rows),
+    buildCategoryKeyboard(source, getConfiguredCategories(source, config.categories)),
+  );
+});
+
+bot.action(/edit_source_(.+)/, async (ctx) => {
+  const channelId = (ctx.match as any)[1];
+  const config = (await prisma.channelConfig.findUnique({
+    where: { id: channelId },
+  })) as StoredChannelConfig | null;
+  if (!config) return;
+
+  const userId = ctx.from!.id;
+  const source = normalizeSource(config.source);
+  userStates.set(userId, {
+    step: "AWAITING_SOURCE",
+    channelId: config.id,
+    channelName: config.name ?? config.id,
+    source,
+    categories: getConfiguredCategories(source, config.categories),
+    scheduledTimes: config.scheduledTimes,
+    postsPerDay: config.postsPerDay,
+    isRandom: config.isRandom,
+  });
+
+  await ctx.editMessageText(
+    "Choose the news source for this channel:",
+    buildSourceKeyboard(source),
   );
 });
 
 bot.action(/edit_time_(.+)/, async (ctx) => {
   const channelId = (ctx.match as any)[1];
-  const config = await prisma.channelConfig.findUnique({
+  const config = (await prisma.channelConfig.findUnique({
     where: { id: channelId },
-  });
+  })) as StoredChannelConfig | null;
   if (!config) return;
 
   if (!config) return;
 
   const userId = ctx.from!.id;
+  const source = normalizeSource(config.source);
   userStates.set(userId, {
     step: "AWAITING_TIMING_TYPE",
     channelId: config.id,
     channelName: config.name ?? config.id,
-    categories: config.categories,
+    source,
+    categories: getConfiguredCategories(source, config.categories),
     scheduledTimes: config.scheduledTimes,
     postsPerDay: config.postsPerDay,
     isRandom: config.isRandom,
@@ -268,30 +366,55 @@ bot.command("test", async (ctx) => {
 });
 
 async function triggerNewsPost(ctx: Context, channelId: string) {
-  const config = await prisma.channelConfig.findUnique({
+  const config = (await prisma.channelConfig.findUnique({
     where: { id: channelId },
-  });
+  })) as StoredChannelConfig | null;
   if (!config) {
     return ctx.reply("❌ Configuration not found.");
   }
 
-  const category =
-    config.categories[Math.floor(Math.random() * config.categories.length)] ||
-    "general";
-  const articles = await fetchTopHeadlines(category);
-  const message = formatNewsMessage(articles, category);
+  const source = normalizeSource(config.source);
+  const category = selectCategory(source, config.categories);
+  const articles = await findArticlesToPost(
+    source,
+    category,
+    config.sentArticleUrls ?? [],
+  );
+
+  if (articles.length === 0) {
+    const noNewsMessage = formatNoNewsMessage(
+      source,
+      category,
+      config.name ?? config.id,
+    );
+    if (ctx.callbackQuery) {
+      await ctx.answerCbQuery("No news found. Nothing was posted.");
+    }
+    await ctx.reply(noNewsMessage);
+    return;
+  }
+
+  const message = formatNewsMessage(articles, category, source);
 
   try {
     await ctx.telegram.sendMessage(channelId, message, {
-      parse_mode: "Markdown",
-      link_preview_options: { is_disabled: false },
+      link_preview_options: { is_disabled: true },
     });
+
+    await (prisma.channelConfig as any).update({
+      where: { id: channelId },
+      data: {
+        lastPostedAt: new Date(),
+        sentArticleUrls: [
+          ...new Set([...(config.sentArticleUrls ?? []), ...articles.map((article) => article.url)]),
+        ].slice(-200),
+      },
+    });
+
     if (ctx.callbackQuery) {
       await ctx.answerCbQuery("News posted!");
     }
-    await ctx.reply(`✅ News successfully posted to **${config.name ?? config.id}**!`, {
-      parse_mode: "Markdown",
-    });
+    await ctx.reply(`Posted ${articles.length} story${articles.length === 1 ? "" : "ies"} to ${config.name ?? config.id}.`);
   } catch (err: any) {
     const errorMsg = `❌ Failed to post news: ${err.message}`;
     if (ctx.callbackQuery) {
@@ -385,23 +508,13 @@ bot.on(["text", "forward_date"], async (ctx) => {
 
       state.channelId = channelId;
       state.channelName = channelName || channelId;
-      state.step = "AWAITING_CATEGORIES";
-
-      const buttons = NEWS_CATEGORIES.map((cat) =>
-        Markup.button.callback(cat, `setup_toggle_${cat}`),
-      );
-      const rows = [];
-      for (let i = 0; i < buttons.length; i += 2)
-        rows.push(buttons.slice(i, i + 2));
-      rows.push([
-        Markup.button.callback("✅ Done Selecting", "setup_categories_done"),
-      ]);
+      state.step = "AWAITING_SOURCE";
 
       ctx.reply(
-        `✅ Found channel: **${channelName || channelId}**\n\nNow, select the news categories you want to post:`,
+        `✅ Found channel: **${channelName || channelId}**\n\nChoose which source to use for this channel:`,
         {
           parse_mode: "Markdown",
-          ...Markup.inlineKeyboard(rows),
+          ...buildSourceKeyboard(state.source),
         },
       );
     } else {
@@ -470,6 +583,43 @@ bot.on(["text", "forward_date"], async (ctx) => {
 });
 
 // Handle Category Toggles
+bot.action(/setup_source_(newsapi|devto)/, async (ctx) => {
+  const userId = ctx.from?.id;
+  if (!userId) return ctx.answerCbQuery();
+
+  const state = userStates.get(userId);
+  if (!state || !state.channelId) {
+    return ctx.answerCbQuery();
+  }
+
+  const source = ((ctx.match as RegExpExecArray)[1] ?? "newsapi") as NewsSource;
+  state.source = source;
+
+  if (source === "devto") {
+    state.categories = ["technology"];
+    state.step = "AWAITING_TIMING_TYPE";
+    await ctx.editMessageText(
+      "DEV Community selected.\n\nThis source is technology-focused, so the category is locked to `technology`.\n\nHow would you like the posts to be timed?",
+      {
+        parse_mode: "Markdown",
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback("🕒 Specific Times", "timing_specific")],
+          [Markup.button.callback("🎲 Random Times", "timing_random")],
+        ]),
+      },
+    );
+    return ctx.answerCbQuery("DEV Community selected.");
+  }
+
+  state.categories = getConfiguredCategories(source, state.categories);
+  state.step = "AWAITING_CATEGORIES";
+  await ctx.editMessageText(
+    `Source selected: ${getSourceLabel(source)}\n\nSelect the news categories for this channel:`,
+    buildCategoryKeyboard(source, state.categories),
+  );
+  return ctx.answerCbQuery("NewsAPI selected.");
+});
+
 bot.action(/setup_toggle_(.+)/, async (ctx) => {
   const userId = ctx.from?.id;
   const state = userStates.get(userId);
@@ -477,30 +627,20 @@ bot.action(/setup_toggle_(.+)/, async (ctx) => {
     return ctx.answerCbQuery();
 
   const category = (ctx.match as any)[1];
+  const source = state.source ?? "newsapi";
+  if (!getAvailableCategories(source).includes(category)) {
+    return ctx.answerCbQuery("That category is not available for this source.");
+  }
+
   if (state.categories.includes(category)) {
     state.categories = state.categories.filter((c) => c !== category);
   } else {
     state.categories.push(category);
   }
 
-  const buttons = NEWS_CATEGORIES.map((cat) => {
-    const isSelected = state.categories.includes(cat);
-    return Markup.button.callback(
-      `${isSelected ? "✅ " : ""}${cat}`,
-      `setup_toggle_${cat}`,
-    );
-  });
-
-  const rows = [];
-  for (let i = 0; i < buttons.length; i += 2)
-    rows.push(buttons.slice(i, i + 2));
-  rows.push([
-    Markup.button.callback("✅ Done Selecting", "setup_categories_done"),
-  ]);
-
   await ctx.editMessageText(
     `Selected: ${state.categories.join(", ") || "None"}\n\nSelect news categories:`,
-    Markup.inlineKeyboard(rows),
+    buildCategoryKeyboard(source, state.categories),
   );
   ctx.answerCbQuery();
 });
@@ -511,6 +651,8 @@ bot.action("setup_categories_done", async (ctx) => {
   const state = userStates.get(userId);
   if (!state || state.categories.length === 0)
     return ctx.answerCbQuery("Select at least one category!");
+
+  state.categories = getConfiguredCategories(state.source ?? "newsapi", state.categories);
 
   state.step = "AWAITING_TIMING_TYPE";
   await ctx.editMessageText(
@@ -554,13 +696,17 @@ async function saveConfiguration(
   const channelId = state.channelId;
   if (!channelId) return;
 
+  const source = state.source ?? "newsapi";
+  const categories = getConfiguredCategories(source, state.categories);
+
   try {
-    await prisma.channelConfig.upsert({
+    await (prisma.channelConfig as any).upsert({
       where: { id: channelId },
       update: {
         name: state.channelName ?? null,
         ownerId: BigInt(userId),
-        categories: state.categories,
+        source,
+        categories,
         scheduledTimes: state.scheduledTimes,
         postsPerDay: state.postsPerDay,
         isRandom: state.isRandom ?? false,
@@ -571,7 +717,8 @@ async function saveConfiguration(
         id: channelId,
         name: state.channelName ?? null,
         ownerId: BigInt(userId),
-        categories: state.categories,
+        source,
+        categories,
         scheduledTimes: state.scheduledTimes,
         postsPerDay: state.postsPerDay,
         isRandom: state.isRandom ?? false,
@@ -581,7 +728,7 @@ async function saveConfiguration(
 
     userStates.delete(userId);
     await ctx.reply(
-      `🎉 **Configuration saved!**\n\nChannel: ${state.channelName}\nCategories: ${state.categories.join(", ")}\nTiming: ${state.isRandom ? "Randomly" : state.scheduledTimes.join(", ")} (${state.postsPerDay} per day)\n\nI will start posting news shortly!`,
+      `🎉 **Configuration saved!**\n\nChannel: ${state.channelName}\nSource: ${getSourceLabel(source)}\nCategories: ${categories.join(", ")}\nTiming: ${state.isRandom ? "Randomly" : state.scheduledTimes.join(", ")} (${state.postsPerDay} per day)\n\nI will start posting news shortly!`,
       {
         parse_mode: "Markdown",
         ...Markup.inlineKeyboard([

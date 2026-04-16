@@ -13,7 +13,9 @@ model ChannelConfig {
   id             String    @id
   name           String?
   ownerId        BigInt
+  source         String    @default("newsapi")
   categories     String[]
+  sentArticleUrls String[] @default([])
   scheduledTimes String[]
   postsPerDay    Int       @default(1)
   isRandom       Boolean   @default(false)
