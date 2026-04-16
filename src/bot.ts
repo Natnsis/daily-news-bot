@@ -86,10 +86,12 @@ bot.action(/manage_(.+)/, async (ctx) => {
   const config = await prisma.channelConfig.findUnique({
     where: { id: channelId },
   });
-  if (!config) return ctx.answerCbQuery("Config not found.");
+  if (!config) {
+    return ctx.answerCbQuery("Config not found.");
+  }
 
   const message =
-    `⚙️ **Managing: ${config.name}**\n\n` +
+    `⚙️ **Managing: ${config.name ?? config.id}**\n\n` +
     `Categories: ${config.categories.join(", ")}\n` +
     `Timing: ${config.isRandom ? "🎲 Random" : "🕒 " + config.scheduledTimes.join(", ")}\n` +
     `Frequency: ${config.postsPerDay} per day\n` +
@@ -140,7 +142,7 @@ bot.action(/edit_cat_(.+)/, async (ctx) => {
   userStates.set(userId, {
     step: "AWAITING_CATEGORIES",
     channelId: config.id,
-    channelName: config.name || config.id,
+    channelName: config.name ?? config.id,
     categories: config.categories,
     scheduledTimes: config.scheduledTimes,
     postsPerDay: config.postsPerDay,
@@ -175,11 +177,13 @@ bot.action(/edit_time_(.+)/, async (ctx) => {
   });
   if (!config) return;
 
+  if (!config) return;
+
   const userId = ctx.from!.id;
   userStates.set(userId, {
     step: "AWAITING_TIMING_TYPE",
     channelId: config.id,
-    channelName: config.name || config.id,
+    channelName: config.name ?? config.id,
     categories: config.categories,
     scheduledTimes: config.scheduledTimes,
     postsPerDay: config.postsPerDay,
@@ -243,7 +247,8 @@ bot.command("test", async (ctx) => {
 
   if (configs.length === 1) {
     const config = configs[0];
-    await ctx.reply(`🚀 Sending an instant news post to **${config.name}**...`, {
+    if (!config) return;
+    await ctx.reply(`🚀 Sending an instant news post to **${config.name ?? config.id}**...`, {
       parse_mode: "Markdown",
     });
     return triggerNewsPost(ctx, config.id);
@@ -266,7 +271,9 @@ async function triggerNewsPost(ctx: Context, channelId: string) {
   const config = await prisma.channelConfig.findUnique({
     where: { id: channelId },
   });
-  if (!config) return ctx.reply("❌ Configuration not found.");
+  if (!config) {
+    return ctx.reply("❌ Configuration not found.");
+  }
 
   const category =
     config.categories[Math.floor(Math.random() * config.categories.length)] ||
@@ -282,7 +289,7 @@ async function triggerNewsPost(ctx: Context, channelId: string) {
     if (ctx.callbackQuery) {
       await ctx.answerCbQuery("News posted!");
     }
-    await ctx.reply(`✅ News successfully posted to **${config.name}**!`, {
+    await ctx.reply(`✅ News successfully posted to **${config.name ?? config.id}**!`, {
       parse_mode: "Markdown",
     });
   } catch (err: any) {
@@ -296,7 +303,9 @@ async function triggerNewsPost(ctx: Context, channelId: string) {
 
 bot.action(/trigger_post_(.+)/, async (ctx) => {
   const channelId = (ctx.match as any)[1];
-  await triggerNewsPost(ctx, channelId);
+  if (channelId) {
+    await triggerNewsPost(ctx, channelId);
+  }
 });
 
 // Handle text and forwarded messages for channel identification
@@ -310,23 +319,26 @@ bot.on(["text", "forward_date"], async (ctx) => {
     let channelId: string | undefined;
     let channelName: string | undefined;
 
-    if ("forward_from_chat" in ctx.message!) {
-      const chat = ctx.message.forward_from_chat;
-      if (chat?.type === "channel") {
+    const msg = ctx.message as any;
+    if (!msg) return;
+
+    if (msg.forward_from_chat) {
+      const chat = msg.forward_from_chat;
+      if (chat.type === "channel") {
         channelId = chat.id.toString();
-        channelName = "title" in chat ? chat.title : chat.id.toString();
+        channelName = chat.title || chat.id.toString();
       }
-    } else if ("text" in ctx.message!) {
-      const text = ctx.message.text;
+    } else if (msg.text) {
+      const text = msg.text;
       try {
         const chat = await ctx.telegram.getChat(text);
         if (chat.type === "channel") {
           channelId = chat.id.toString();
-          channelName = "title" in chat ? chat.title : chat.id.toString();
+          channelName = (chat as any).title || chat.id.toString();
         }
       } catch (err) {
         return ctx.reply(
-          "❌ Could not find that channel. Make sure it's public and I am added to it.",
+          "❌ Could not find that channel. Make sure it\'s public and I am added to it.",
         );
       }
     }
@@ -338,7 +350,7 @@ bot.on(["text", "forward_date"], async (ctx) => {
       });
       if (existing) {
         return ctx.reply(
-          `⚠️ **${existing.name}** is already configured.\n\nWould you like to manage its settings instead?`,
+          `⚠️ **${existing.name ?? existing.id}** is already configured.\n\nWould you like to manage its settings instead?`,
           {
             parse_mode: "Markdown",
             ...Markup.inlineKeyboard([
@@ -372,7 +384,7 @@ bot.on(["text", "forward_date"], async (ctx) => {
       }
 
       state.channelId = channelId;
-      state.channelName = channelName;
+      state.channelName = channelName || channelId;
       state.step = "AWAITING_CATEGORIES";
 
       const buttons = NEWS_CATEGORIES.map((cat) =>
@@ -386,7 +398,7 @@ bot.on(["text", "forward_date"], async (ctx) => {
       ]);
 
       ctx.reply(
-        `✅ Found channel: **${channelName}**\n\nNow, select the news categories you want to post:`,
+        `✅ Found channel: **${channelName || channelId}**\n\nNow, select the news categories you want to post:`,
         {
           parse_mode: "Markdown",
           ...Markup.inlineKeyboard(rows),
@@ -398,15 +410,44 @@ bot.on(["text", "forward_date"], async (ctx) => {
       );
     }
   } else if (state.step === "AWAITING_SPECIFIC_TIMES") {
-    if ("text" in ctx.message!) {
-      const times = ctx.message.text.split(",").map((t) => t.trim());
-      const validTimes = times.filter((t) =>
-        /^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/.test(t),
-      );
+    if (ctx.message && "text" in ctx.message) {
+      const parts = ctx.message.text
+        .split(",")
+        .map((t: string) => t.trim().toLowerCase());
+      const validTimes: string[] = [];
+
+      for (const part of parts) {
+        // Try 24h format HH:mm
+        if (/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/.test(part)) {
+          validTimes.push(part.padStart(5, "0"));
+          continue;
+        }
+
+        // Try AM/PM format h:mm am/pm
+        const ampmMatch = part.match(/^(\d{1,2}):(\d{2})\s*(am|pm)$/);
+        if (ampmMatch) {
+          const [, hourText, minute, period] = ampmMatch;
+          if (!hourText || !minute || !period) {
+            continue;
+          }
+
+          let hour = parseInt(hourText, 10);
+
+          if (hour >= 1 && hour <= 12) {
+            if (period === "pm" && hour < 12) hour += 12;
+            if (period === "am" && hour === 12) hour = 0;
+
+            const formatted = `${hour.toString().padStart(2, "0")}:${minute}`;
+            validTimes.push(formatted);
+            continue;
+          }
+        }
+      }
 
       if (validTimes.length === 0) {
         return ctx.reply(
-          "❌ Please enter valid times in HH:mm format (e.g., 01:20, 14:00).",
+          "❌ Invalid format. Please enter times like `01:20 am`, `2:00 pm`, or `14:00`.",
+          { parse_mode: "Markdown" },
         );
       }
 
@@ -416,7 +457,7 @@ bot.on(["text", "forward_date"], async (ctx) => {
       await saveConfiguration(ctx, userId, state);
     }
   } else if (state.step === "AWAITING_FREQUENCY") {
-    if ("text" in ctx.message!) {
+    if (ctx.message && "text" in ctx.message) {
       const freq = parseInt(ctx.message.text);
       if (isNaN(freq) || freq < 1 || freq > 20) {
         return ctx.reply("❌ Please enter a number between 1 and 20.");
@@ -489,7 +530,7 @@ bot.action("timing_specific", async (ctx) => {
 
   state.step = "AWAITING_SPECIFIC_TIMES";
   await ctx.editMessageText(
-    "Enter the times for posting separated by commas (e.g., `01:20, 14:00, 20:30`):",
+    "Enter the times for posting separated by commas.\nYou can use 24-hour format or AM/PM (e.g., `1:20 am, 2:00 pm, 20:30`):",
     { parse_mode: "Markdown" },
   );
 });
@@ -510,27 +551,30 @@ async function saveConfiguration(
   userId: number,
   state: SetupState,
 ) {
+  const channelId = state.channelId;
+  if (!channelId) return;
+
   try {
     await prisma.channelConfig.upsert({
-      where: { id: state.channelId },
+      where: { id: channelId },
       update: {
-        name: state.channelName,
+        name: state.channelName ?? null,
         ownerId: BigInt(userId),
         categories: state.categories,
         scheduledTimes: state.scheduledTimes,
         postsPerDay: state.postsPerDay,
-        isRandom: state.isRandom,
+        isRandom: state.isRandom ?? false,
         timezone: process.env.DEFAULT_TIMEZONE || "UTC",
         isActive: true,
       },
       create: {
-        id: state.channelId!,
-        name: state.channelName,
+        id: channelId,
+        name: state.channelName ?? null,
         ownerId: BigInt(userId),
         categories: state.categories,
         scheduledTimes: state.scheduledTimes,
         postsPerDay: state.postsPerDay,
-        isRandom: state.isRandom,
+        isRandom: state.isRandom ?? false,
         timezone: process.env.DEFAULT_TIMEZONE || "UTC",
       },
     });
