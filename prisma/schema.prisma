@@ -14,9 +14,12 @@ model ChannelConfig {
   name           String?
   ownerId        BigInt
   categories     String[]
-  scheduledHours Int[]
+  scheduledTimes String[]
+  postsPerDay    Int       @default(1)
+  isRandom       Boolean   @default(false)
   timezone       String    @default("UTC")
   lastPostedAt   DateTime?
+  nextRunAt      DateTime?
   isActive       Boolean   @default(true)
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
