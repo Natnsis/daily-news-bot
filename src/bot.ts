@@ -739,7 +739,22 @@ async function saveConfiguration(
     );
   } catch (err: any) {
     console.error("Save failed:", err);
-    await ctx.reply(`❌ Failed to save configuration: ${err.message}`);
+    const errorMessage = String(err?.message ?? "");
+    const isPrismaSchemaMismatch =
+      errorMessage.includes("Unknown argument `source`") ||
+      errorMessage.includes("Unknown argument `sentArticleUrls`") ||
+      errorMessage.includes("column") ||
+      errorMessage.includes("does not exist");
+
+    if (isPrismaSchemaMismatch) {
+      await ctx.reply(
+        "❌ Configuration could not be saved because Prisma is not synced with the latest schema yet.\n\nRun `npm run prisma:sync` and restart the bot, then try again.",
+        { parse_mode: "Markdown" },
+      );
+      return;
+    }
+
+    await ctx.reply(`❌ Failed to save configuration: ${errorMessage}`);
   }
 }
 
